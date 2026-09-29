@@ -1,6 +1,6 @@
 Package: com.tom.vcamtesttweak
 Name: VCam Test Tweak
-Version: 1.0.0
+Version: 1.0.1
 Architecture: iphoneos-arm64
 Description: Rootless test tweak for a user-controlled test host app
 Maintainer: Local Test
