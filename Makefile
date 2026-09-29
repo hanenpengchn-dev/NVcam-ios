@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = VCamTestTweak
 VCamTestTweak_FILES = Tweak.x
-VCamTestTweak_CFLAGS = -fobjc-arc
+VCamTestTweak_CFLAGS = -fobjc-arc -Wno-error=deprecated-declarations
 VCamTestTweak_FRAMEWORKS = UIKit Foundation
 
 include $(THEOS_MAKE_PATH)/tweak.mk

@@ -27,9 +27,13 @@ jobs:
       - name: Failure diagnostics
         if: failure()
         run: |
-          echo "=== tail of build log ==="
-          tail -n 40 build.log 2>/dev/null || echo "(no build.log)"
-          MSG=$(tail -n 40 build.log 2>/dev/null | tr -d '\r' | tr '\n' '|' | sed 's/%/%25/g' | tail -c 1900)
+          echo "=== error lines ==="
+          grep -nE "error:|fatal error" build.log 2>/dev/null | head -40 || echo "(no errors in build.log)"
+          echo "=== Theos dir ==="
+          ls -la Theos 2>&1 || true
+          echo "=== pch files (excl ./theos) ==="
+          find . -maxdepth 4 -iname "*pch*" 2>/dev/null | grep -v "^\./theos" | head -20 || true
+          MSG=$( { grep -nE "error:|fatal error" build.log 2>/dev/null | head -25; echo "===TAIL==="; tail -n 20 build.log 2>/dev/null; } | tr -d '\r' | tr '\n' '|' | sed 's/%/%25/g' | tail -c 2600 )
           printf '::error title=VCam deb build failed::%s\n' "$MSG"
 
       - name: Upload deb
