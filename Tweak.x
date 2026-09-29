@@ -4,6 +4,8 @@
 #import <CoreVideo/CoreVideo.h>
 #import <CoreText/CoreText.h>
 #import <QuartzCore/QuartzCore.h>
+#import <CoreImage/CoreImage.h>
+#import <PhotosUI/PhotosUI.h>
 #include <time.h>
 
 #pragma mark - Globals
@@ -11,6 +13,7 @@
 static UILabel *VCAMLabel = nil;
 static UIButton *VCAMToggleButton = nil;
 static UIButton *VCAMLogButton = nil;
+static UIButton *VCamVidButton = nil;
 static UIView *VCamLogPanel = nil;
 static UITextView *VCamLogView = nil;
 static BOOL VCamIsOn = NO;
@@ -20,10 +23,18 @@ static NSMapTable *VCamPreviewMap = nil;
 static NSTimer *VCamOverlayTimer = nil;
 static unsigned long VCamOverlayFrame = 0;
 static unsigned long VCamFakeFrames = 0;
+static NSString *VCamVideoPath = nil;
+static NSLock *VCamVideoLock = nil;
+static CVPixelBufferRef VCamCurrentVideoFrame = NULL;
+static int VCamVideoGen = 0;
+static CIContext *VCamCIContext = nil;
+static id VCamPicker = nil;
 
 static void VCamTryAttach(int attemptsLeft);
 static void VCamApplyState(void);
 static void VCamStartOverlayTimerIfNeeded(void);
+static void VCamRestartVideoPump(void);
+static UIWindow *VCamFindWindow(void);
 
 #pragma mark - Logging
 
@@ -138,6 +149,26 @@ static void VCamDrawPattern(CGContextRef ctx, CGSize size, unsigned long frameNo
 
 #pragma mark - Frame factory
 
+static CMSampleBufferRef VCamCreateSampleBufferFromPixelBuffer(CVPixelBufferRef pb, unsigned long frameNo) CF_RETURNS_RETAINED;
+static CMSampleBufferRef VCamCreateSampleBufferFromPixelBuffer(CVPixelBufferRef pb, unsigned long frameNo) {
+    CMVideoFormatDescriptionRef fmt = NULL;
+    OSStatus s = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fmt);
+    if (s != noErr || !fmt) {
+        return NULL;
+    }
+    CMSampleTimingInfo timing;
+    timing.duration = CMTimeMake(1, 30);
+    timing.presentationTimeStamp = CMTimeMake((int64_t)frameNo, 30);
+    timing.decodeTimeStamp = kCMTimeInvalid;
+    CMSampleBufferRef sb = NULL;
+    s = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pb, fmt, &timing, &sb);
+    CFRelease(fmt);
+    if (s != noErr) {
+        return NULL;
+    }
+    return sb;
+}
+
 static CMSampleBufferRef VCamCreateFakeFrame(unsigned long frameNo) CF_RETURNS_RETAINED;
 static CMSampleBufferRef VCamCreateFakeFrame(unsigned long frameNo) {
     size_t w = 1280, h = 720;
@@ -165,25 +196,8 @@ static CMSampleBufferRef VCamCreateFakeFrame(unsigned long frameNo) {
     }
     CVPixelBufferUnlockBaseAddress(pb, 0);
 
-    CMVideoFormatDescriptionRef fmt = NULL;
-    OSStatus s = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fmt);
-    if (s != noErr || !fmt) {
-        CVPixelBufferRelease(pb);
-        return NULL;
-    }
-
-    CMSampleTimingInfo timing;
-    timing.duration = CMTimeMake(1, 30);
-    timing.presentationTimeStamp = CMTimeMake((int64_t)frameNo, 30);
-    timing.decodeTimeStamp = kCMTimeInvalid;
-
-    CMSampleBufferRef sb = NULL;
-    s = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pb, fmt, &timing, &sb);
-    CFRelease(fmt);
+    CMSampleBufferRef sb = VCamCreateSampleBufferFromPixelBuffer(pb, frameNo);
     CVPixelBufferRelease(pb);
-    if (s != noErr) {
-        return NULL;
-    }
     return sb;
 }
 
@@ -203,13 +217,111 @@ static CGImageRef VCamCreatePatternImage(unsigned long frameNo) {
     return img;
 }
 
+#pragma mark - Video source (picked from album / fixed path)
+
+static void VCamRestartVideoPump(void) {
+    VCamVideoGen++;
+    int gen = VCamVideoGen;
+    NSString *path = [VCamVideoPath copy];
+    if (!path || !VCamIsOn) {
+        return;
+    }
+    if (!VCamVideoLock) {
+        VCamVideoLock = [[NSLock alloc] init];
+    }
+    VCamLog(@"视频泵启动: %@", path.lastPathComponent);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        while (gen == VCamVideoGen) {
+            @autoreleasepool {
+                NSURL *url = [NSURL fileURLWithPath:path];
+                AVAsset *asset = [AVAsset assetWithURL:url];
+                NSError *err = nil;
+                AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
+                AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+                if (reader && track) {
+                    AVAssetReaderTrackOutput *out =
+                        [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track
+                            outputSettings:@{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA) }];
+                    out.alwaysCopiesSampleData = NO;
+                    if ([reader canAddOutput:out]) {
+                        [reader addOutput:out];
+                        [reader startReading];
+                        while (gen == VCamVideoGen && reader.status == AVAssetReaderStatusReading) {
+                            CMSampleBufferRef sb = [out copyNextSampleBuffer];
+                            if (!sb) {
+                                break;
+                            }
+                            CVImageBufferRef img = CMSampleBufferGetImageBuffer(sb);
+                            if (img) {
+                                [VCamVideoLock lock];
+                                if (VCamCurrentVideoFrame) {
+                                    CFRelease(VCamCurrentVideoFrame);
+                                }
+                                VCamCurrentVideoFrame = (CVPixelBufferRef)CFRetain(img);
+                                [VCamVideoLock unlock];
+                            }
+                            CFRelease(sb);
+                            usleep(33333);
+                        }
+                        [reader cancelReading];
+                    }
+                } else {
+                    VCamLog(@"视频读取失败: %@", err.localizedDescription ?: @"?");
+                    sleep(1);
+                }
+            }
+            usleep(30000);
+        }
+    });
+}
+
+static CVPixelBufferRef VCamCopyCurrentVideoFrame(void) CF_RETURNS_RETAINED;
+static CVPixelBufferRef VCamCopyCurrentVideoFrame(void) {
+    CVPixelBufferRef out = NULL;
+    if (VCamVideoLock) {
+        [VCamVideoLock lock];
+        if (VCamCurrentVideoFrame) {
+            out = (CVPixelBufferRef)CFRetain(VCamCurrentVideoFrame);
+        }
+        [VCamVideoLock unlock];
+    }
+    return out;
+}
+
+static CGImageRef VCamCreateVideoCGImage(void) CF_RETURNS_RETAINED;
+static CGImageRef VCamCreateVideoCGImage(void) {
+    CVPixelBufferRef vf = VCamCopyCurrentVideoFrame();
+    if (!vf) {
+        return NULL;
+    }
+    if (!VCamCIContext) {
+        VCamCIContext = [CIContext contextWithOptions:nil];
+    }
+    CIImage *ci = [CIImage imageWithCVPixelBuffer:vf];
+    CGImageRef img = [VCamCIContext createCGImage:ci
+                                         fromRect:CGRectMake(0, 0,
+                                            (CGFloat)CVPixelBufferGetWidth(vf),
+                                            (CGFloat)CVPixelBufferGetHeight(vf))];
+    CVPixelBufferRelease(vf);
+    return img;
+}
+
+static void VCamSetVideoSource(NSString *path) {
+    if (!VCamVideoLock) {
+        VCamVideoLock = [[NSLock alloc] init];
+    }
+    VCamVideoPath = [path copy];
+    VCamLog(@"已设置视频源: %@", VCamVideoPath.lastPathComponent);
+    VCamRestartVideoPump();
+}
+
 #pragma mark - Preview layer overlay
 
 static void VCamStartOverlayTimerIfNeeded(void) {
     if (VCamOverlayTimer) {
         return;
     }
-    VCamOverlayTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+    VCamOverlayTimer = [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *t) {
         if (!VCamPreviewMap || VCamPreviewMap.count == 0) {
             [t invalidate];
             VCamOverlayTimer = nil;
@@ -243,7 +355,10 @@ static void VCamStartOverlayTimerIfNeeded(void) {
             ov.frame = layer.frame;
             ov.hidden = !VCamIsOn;
             if (VCamIsOn) {
-                CGImageRef img = VCamCreatePatternImage(VCamOverlayFrame);
+                CGImageRef img = VCamCreateVideoCGImage();
+                if (!img) {
+                    img = VCamCreatePatternImage(VCamOverlayFrame);
+                }
                 if (img) {
                     ov.contents = (__bridge id)img;
                     CGImageRelease(img);
@@ -296,7 +411,15 @@ static void VCamTrackPreviewLayer(CALayer *layer) {
     if (VCamIsOn) {
         @try {
             VCamFakeFrames++;
-            CMSampleBufferRef fake = VCamCreateFakeFrame(VCamFakeFrames);
+            CMSampleBufferRef fake = NULL;
+            CVPixelBufferRef vf = VCamCopyCurrentVideoFrame();
+            if (vf) {
+                fake = VCamCreateSampleBufferFromPixelBuffer(vf, VCamFakeFrames);
+                CVPixelBufferRelease(vf);
+            }
+            if (!fake) {
+                fake = VCamCreateFakeFrame(VCamFakeFrames);
+            }
             if (fake) {
                 if (origHandles) {
                     [orig captureOutput:output didOutputSampleBuffer:fake fromConnection:connection];
@@ -326,6 +449,69 @@ static void VCamTrackPreviewLayer(CALayer *layer) {
 }
 
 @end
+
+#pragma mark - Video picker
+
+@interface VCamPickerDelegate : NSObject <PHPickerViewControllerDelegate>
+@end
+
+@implementation VCamPickerDelegate
+
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    PHPickerResult *res = results.firstObject;
+    if (!res) {
+        return;
+    }
+    [res.itemProvider loadFileRepresentationForTypeIdentifier:@"public.movie"
+                                            completionHandler:^(NSURL *url, NSError *error) {
+        if (!url) {
+            VCamLog(@"选视频失败: %@", error.localizedDescription ?: @"?");
+            return;
+        }
+        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *dst = [docs stringByAppendingPathComponent:@"vcam_picked.mov"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm removeItemAtPath:dst error:NULL];
+        NSError *cpErr = nil;
+        if ([fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:dst] error:&cpErr]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                VCamIsOn = YES;
+                VCamApplyState();
+                VCamSetVideoSource(dst);
+                VCamLog(@"已选相册视频，虚拟相机自动开启");
+            });
+        } else {
+            VCamLog(@"保存视频失败: %@", cpErr.localizedDescription ?: @"?");
+        }
+    }];
+}
+
+@end
+
+static void VCamPresentVideoPicker(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *win = VCamFindWindow();
+        UIViewController *vc = win.rootViewController;
+        if (!vc) {
+            VCamLog(@"打不开选择器（无窗口）");
+            return;
+        }
+        while (vc.presentedViewController) {
+            vc = vc.presentedViewController;
+        }
+        if (!VCamPicker) {
+            VCamPicker = [[VCamPickerDelegate alloc] init];
+        }
+        PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+        cfg.filter = [PHPickerFilter videosFilter];
+        cfg.selectionLimit = 1;
+        PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+        picker.delegate = (id<PHPickerViewControllerDelegate>)VCamPicker;
+        [vc presentViewController:picker animated:YES completion:nil];
+        VCamLog(@"已打开相册选择器（选一个视频）");
+    });
+}
 
 #pragma mark - UI
 
@@ -410,6 +596,7 @@ static void VCamInstallUI(UIWindow *window) {
     [VCAMToggleButton removeFromSuperview];
     [VCAMLogButton removeFromSuperview];
     [VCamLogPanel removeFromSuperview];
+    [VCamVidButton removeFromSuperview];
 
     VCAMLabel = [[UILabel alloc]
         initWithFrame:CGRectMake(16, 48, 230, 34)];
@@ -435,6 +622,7 @@ static void VCamInstallUI(UIWindow *window) {
     [VCAMToggleButton addAction:[UIAction actionWithHandler:^(UIAction *action) {
         VCamIsOn = !VCamIsOn;
         VCamApplyState();
+        VCamRestartVideoPump();
         VCamLog(@"虚拟相机: %@", VCamIsOn ? @"ON" : @"OFF");
     }] forControlEvents:UIControlEventTouchUpInside];
 
@@ -466,6 +654,19 @@ static void VCamInstallUI(UIWindow *window) {
     }] forControlEvents:UIControlEventTouchUpInside];
     [window addSubview:VCAMLogButton];
 
+    VCamVidButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    VCamVidButton.frame = CGRectMake(startX, 120.0 + side + 46.0, side, 30.0);
+    VCamVidButton.layer.cornerRadius = 15.0;
+    VCamVidButton.clipsToBounds = YES;
+    VCamVidButton.backgroundColor = [[UIColor colorWithRed:0.85 green:0.30 blue:0.55 alpha:0.9] colorWithAlphaComponent:0.9];
+    VCamVidButton.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
+    [VCamVidButton setTitle:@"VID" forState:UIControlStateNormal];
+    [VCamVidButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    [VCamVidButton addAction:[UIAction actionWithHandler:^(UIAction *action) {
+        VCamPresentVideoPicker();
+    }] forControlEvents:UIControlEventTouchUpInside];
+    [window addSubview:VCamVidButton];
+
     VCamLogPanel = [[UIView alloc] initWithFrame:CGRectMake(16, 92, 320, 210)];
     VCamLogPanel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.80];
     VCamLogPanel.layer.cornerRadius = 10.0;
@@ -483,7 +684,23 @@ static void VCamInstallUI(UIWindow *window) {
 
     VCamApplyState();
 
-    VCamLog(@"attached (virtual-camera v2) in %@",
+    if (!VCamVideoPath) {
+        NSArray<NSString *> *cands = @[
+            @"/var/jb/var/mobile/Library/Preferences/vcam_video.mp4",
+            @"/var/jb/var/mobile/Library/Preferences/vcam_video.mov",
+            @"/var/mobile/Library/Preferences/vcam_video.mp4",
+            @"/var/mobile/Library/Preferences/vcam_video.mov"
+        ];
+        for (NSString *cand in cands) {
+            if ([[NSFileManager defaultManager] fileExistsAtPath:cand]) {
+                VCamVideoPath = cand;
+                VCamLog(@"固定视频源: %@", cand.lastPathComponent);
+                break;
+            }
+        }
+    }
+
+    VCamLog(@"attached (virtual-camera v2.1) in %@",
             NSBundle.mainBundle.bundleIdentifier ?: @"<unknown>");
 }
 
