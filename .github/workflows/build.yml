@@ -1,0 +1,28 @@
+name: Build NVcam iOS Unsigned IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+jobs:
+  build-unsigned-ipa:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+      - name: Build unsigned app
+        run: |
+          set -euo pipefail
+          rm -rf build Payload NVcam-unsigned.ipa
+          xcodebuild -project NVcam.xcodeproj -scheme NVcam -configuration Release -sdk iphoneos -derivedDataPath build/DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+          APP_PATH="$(find build/DerivedData/Build/Products -maxdepth 2 -name 'NVcam.app' -type d | head -n 1)"
+          test -n "$APP_PATH" || { echo "App not found"; exit 1; }
+          mkdir -p Payload && cp -R "$APP_PATH" Payload/
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent Payload NVcam-unsigned.ipa
+          ls -lh NVcam-unsigned.ipa
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: NVcam-unsigned-ipa
+          path: NVcam-unsigned.ipa
+          retention-days: 30

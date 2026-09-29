@@ -1,0 +1,9 @@
+Package: com.example.nvcam
+Name: NVcam
+Version: 0.1
+Section: Tweaks
+Architecture: iphoneos-arm
+Description: Virtual camera system with mediaserverd hooking for jailbroken iOS devices
+Maintainer: NVcam Dev
+Author: NVcam Dev
+Depends: mobilesubstrate
