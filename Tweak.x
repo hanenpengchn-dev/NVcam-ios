@@ -1,8 +1,9 @@
 #import <UIKit/UIKit.h>
 
 static UILabel *VCAMLabel = nil;
+static void VCamTryInstallOverlay(int attemptsLeft);
 
-static void VCamInstallOverlay(void) {
+static void VCamTryInstallOverlay(int attemptsLeft) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *window = nil;
 
@@ -31,6 +32,14 @@ static void VCamInstallOverlay(void) {
         }
 
         if (!window) {
+            if (attemptsLeft > 1) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    VCamTryInstallOverlay(attemptsLeft - 1);
+                });
+            } else {
+                NSLog(@"[VCamTestTweak] window not found after retries");
+            }
             return;
         }
 
@@ -63,6 +72,6 @@ static void VCamInstallOverlay(void) {
 %ctor {
     if ([NSBundle.mainBundle.bundleIdentifier
          isEqualToString:@"com.tom.VCamTestHost"]) {
-        VCamInstallOverlay();
+        VCamTryInstallOverlay(20);
     }
 }
