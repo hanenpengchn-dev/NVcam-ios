@@ -1,4 +1,8 @@
-import AVFoundation, CoreImage, CoreMedia, Foundation, UIKit
+import AVFoundation
+import CoreImage
+import CoreMedia
+import Foundation
+import UIKit
 final class VirtualCameraSource {
     private let queue = DispatchQueue(label: "com.nvcam.virtualcamera", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
