@@ -752,22 +752,33 @@ static void VCamInstallUI(UIWindow *window) {
     VCamApplyState();
 
     if (!VCamVideoPath) {
-        NSArray<NSString *> *cands = @[
-            @"/var/jb/var/mobile/Library/Preferences/vcam_video.mp4",
-            @"/var/jb/var/mobile/Library/Preferences/vcam_video.mov",
-            @"/var/mobile/Library/Preferences/vcam_video.mp4",
-            @"/var/mobile/Library/Preferences/vcam_video.mov"
-        ];
+        NSMutableArray<NSString *> *cands = [NSMutableArray array];
+        [cands addObject:@"/var/jb/var/mobile/Library/Preferences/vcam_video.mp4"];
+        [cands addObject:@"/var/jb/var/mobile/Library/Preferences/vcam_video.mov"];
+        [cands addObject:@"/var/mobile/Library/Preferences/vcam_video.mp4"];
+        [cands addObject:@"/var/mobile/Library/Preferences/vcam_video.mov"];
+        NSString *docsD = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+        NSString *cacheD = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+        if (docsD) [cands addObject:[docsD stringByAppendingPathComponent:@"vcam_picked.mov"]];
+        if (cacheD) [cands addObject:[cacheD stringByAppendingPathComponent:@"vcam_picked.mov"]];
+        [cands addObject:@"/var/jb/var/mobile/Library/Preferences/vcam_picked.mov"];
         for (NSString *cand in cands) {
             if ([[NSFileManager defaultManager] fileExistsAtPath:cand]) {
                 VCamVideoPath = cand;
-                VCamLog(@"固定视频源: %@", cand.lastPathComponent);
+                VCamLog(@"检测到视频素材: %@", cand.lastPathComponent);
                 break;
             }
         }
     }
 
-    VCamLog(@"attached (virtual-camera v2.2) in %@",
+    if (VCamVideoPath && !VCamIsOn) {
+        VCamIsOn = YES;
+        VCamApplyState();
+        VCamRestartVideoPump();
+        VCamLog(@"已有视频素材，自动开启虚拟相机");
+    }
+
+    VCamLog(@"attached (virtual-camera v2.3) in %@",
             NSBundle.mainBundle.bundleIdentifier ?: @"<unknown>");
 }
 
