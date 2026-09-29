@@ -7,6 +7,7 @@
 #import <CoreImage/CoreImage.h>
 #import <PhotosUI/PhotosUI.h>
 #include <time.h>
+#include <string.h>
 
 #pragma mark - Globals
 
@@ -27,6 +28,7 @@ static NSString *VCamVideoPath = nil;
 static NSLock *VCamVideoLock = nil;
 static CVPixelBufferRef VCamCurrentVideoFrame = NULL;
 static int VCamVideoGen = 0;
+static int VCamVideoOrientation = 1;
 static CIContext *VCamCIContext = nil;
 static id VCamPicker = nil;
 
@@ -239,6 +241,19 @@ static void VCamRestartVideoPump(void) {
                 AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&err];
                 AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
                 if (reader && track) {
+                    CGAffineTransform pt = track.preferredTransform;
+                    int orient = 1;
+                    if (pt.a == 0 && pt.b == 1 && pt.c == -1 && pt.d == 0) {
+                        orient = 6;
+                    } else if (pt.a == 0 && pt.b == -1 && pt.c == 1 && pt.d == 0) {
+                        orient = 8;
+                    } else if (pt.a == -1 && pt.b == 0 && pt.c == 0 && pt.d == -1) {
+                        orient = 3;
+                    }
+                    [VCamVideoLock lock];
+                    VCamVideoOrientation = orient;
+                    [VCamVideoLock unlock];
+
                     AVAssetReaderTrackOutput *out =
                         [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track
                             outputSettings:@{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA) }];
@@ -298,12 +313,66 @@ static CGImageRef VCamCreateVideoCGImage(void) {
         VCamCIContext = [CIContext contextWithOptions:nil];
     }
     CIImage *ci = [CIImage imageWithCVPixelBuffer:vf];
-    CGImageRef img = [VCamCIContext createCGImage:ci
-                                         fromRect:CGRectMake(0, 0,
-                                            (CGFloat)CVPixelBufferGetWidth(vf),
-                                            (CGFloat)CVPixelBufferGetHeight(vf))];
+    int orient = 1;
+    if (VCamVideoLock) {
+        [VCamVideoLock lock];
+        orient = VCamVideoOrientation;
+        [VCamVideoLock unlock];
+    }
+    if (orient != 1) {
+        ci = [ci imageByApplyingOrientation:orient];
+    }
+    CGRect ext = [ci extent];
+    CGImageRef img = [VCamCIContext createCGImage:ci fromRect:ext];
     CVPixelBufferRelease(vf);
     return img;
+}
+
+static CVPixelBufferRef VCamCreateFittedFrame(CVPixelBufferRef videoFrame, size_t cw, size_t ch) CF_RETURNS_RETAINED;
+static CVPixelBufferRef VCamCreateFittedFrame(CVPixelBufferRef videoFrame, size_t cw, size_t ch) {
+    int orient = 1;
+    if (VCamVideoLock) {
+        [VCamVideoLock lock];
+        orient = VCamVideoOrientation;
+        [VCamVideoLock unlock];
+    }
+    if (orient == 1 &&
+        (size_t)CVPixelBufferGetWidth(videoFrame) == cw &&
+        (size_t)CVPixelBufferGetHeight(videoFrame) == ch) {
+        return (CVPixelBufferRef)CFRetain(videoFrame);
+    }
+    CVPixelBufferRef outPB = NULL;
+    NSDictionary *attrs = @{ (__bridge NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+    if (CVPixelBufferCreate(kCFAllocatorDefault, cw, ch, kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)attrs, &outPB) != kCVReturnSuccess || !outPB) {
+        return NULL;
+    }
+    if (!VCamCIContext) {
+        VCamCIContext = [CIContext contextWithOptions:nil];
+    }
+    CVPixelBufferLockBaseAddress(outPB, 0);
+    memset(CVPixelBufferGetBaseAddress(outPB), 0, CVPixelBufferGetDataSize(outPB));
+    CVPixelBufferUnlockBaseAddress(outPB, 0);
+    @try {
+        CIImage *ci = [CIImage imageWithCVPixelBuffer:videoFrame];
+        if (orient != 1) {
+            ci = [ci imageByApplyingOrientation:orient];
+        }
+        CGRect ext = [ci extent];
+        if (ext.size.width > 0 && ext.size.height > 0) {
+            CGFloat scale = MIN((CGFloat)cw / ext.size.width, (CGFloat)ch / ext.size.height);
+            CGFloat sx = ((CGFloat)cw - ext.size.width * scale) / 2.0;
+            CGFloat sy = ((CGFloat)ch - ext.size.height * scale) / 2.0;
+            CIImage *s = [ci imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+            s = [s imageByApplyingTransform:CGAffineTransformMakeTranslation(sx, sy)];
+            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+            [VCamCIContext render:s toCVPixelBuffer:outPB bounds:CGRectMake(0, 0, cw, ch) colorSpace:cs];
+            CGColorSpaceRelease(cs);
+        }
+    } @catch (NSException *e) {
+        VCamLog(@"缩放异常: %@", e.reason ?: @"?");
+    }
+    return outPB;
 }
 
 static void VCamSetVideoSource(NSString *path) {
@@ -342,7 +411,9 @@ static void VCamStartOverlayTimerIfNeeded(void) {
                 CALayer *ov = [CALayer layer];
                 ov.name = @"VCamOverlay";
                 ov.zPosition = 10000;
-                ov.contentsGravity = kCAGravityResize;
+                ov.contentsGravity = kCAGravityResizeAspect;
+                ov.backgroundColor = [UIColor blackColor].CGColor;
+                ov.opaque = YES;
                 [host insertSublayer:ov above:layer];
                 [VCamPreviewMap setObject:ov forKey:layer];
                 val = ov;
@@ -414,7 +485,19 @@ static void VCamTrackPreviewLayer(CALayer *layer) {
             CMSampleBufferRef fake = NULL;
             CVPixelBufferRef vf = VCamCopyCurrentVideoFrame();
             if (vf) {
-                fake = VCamCreateSampleBufferFromPixelBuffer(vf, VCamFakeFrames);
+                CVImageBufferRef camImg = CMSampleBufferGetImageBuffer(sampleBuffer);
+                CVPixelBufferRef fitted = NULL;
+                if (camImg) {
+                    fitted = VCamCreateFittedFrame(vf,
+                                (size_t)CVPixelBufferGetWidth(camImg),
+                                (size_t)CVPixelBufferGetHeight(camImg));
+                }
+                if (fitted) {
+                    fake = VCamCreateSampleBufferFromPixelBuffer(fitted, VCamFakeFrames);
+                    CVPixelBufferRelease(fitted);
+                } else {
+                    fake = VCamCreateSampleBufferFromPixelBuffer(vf, VCamFakeFrames);
+                }
                 CVPixelBufferRelease(vf);
             }
             if (!fake) {
@@ -778,7 +861,7 @@ static void VCamInstallUI(UIWindow *window) {
         VCamLog(@"已有视频素材，自动开启虚拟相机");
     }
 
-    VCamLog(@"attached (virtual-camera v2.3) in %@",
+    VCamLog(@"attached (virtual-camera v2.4) in %@",
             NSBundle.mainBundle.bundleIdentifier ?: @"<unknown>");
 }
 
