@@ -1,7 +1,7 @@
 Package: com.tom.vcamtesttweak
 Name: VCam Test Tweak
-Version: 1.0.2
+Version: 1.1.0
 Architecture: iphoneos-arm64
-Description: Rootless test tweak with floating toggle (loads in all apps)
+Description: Rootless test tweak: floating toggle + app whitelist (vcam_whitelist.txt)
 Maintainer: Local Test
 Depends: firmware (>= 15.0)

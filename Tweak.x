@@ -125,7 +125,7 @@ static void VCamInstallUI(UIWindow *window) {
 
     VCamApplyState();
 
-    NSLog(@"[VCamTestTweak] attached (all-apps build) in %@",
+    NSLog(@"[VCamTestTweak] attached (whitelist build) in %@",
           NSBundle.mainBundle.bundleIdentifier ?: @"<unknown>");
 }
 
@@ -147,6 +147,48 @@ static void VCamTryAttach(int attemptsLeft) {
     });
 }
 
+static NSString *VCamWhitelistContents(void) {
+    NSArray<NSString *> *paths = @[
+        @"/var/jb/var/mobile/Library/Preferences/vcam_whitelist.txt",
+        @"/var/mobile/Library/Preferences/vcam_whitelist.txt"
+    ];
+    for (NSString *p in paths) {
+        NSStringEncoding enc = 0;
+        NSString *content = [NSString stringWithContentsOfFile:p
+                                                     usedEncoding:&enc
+                                                            error:NULL];
+        if (content) {
+            return content;
+        }
+    }
+    return nil;
+}
+
+static BOOL VCamIsWhitelisted(NSString *bundleID) {
+    NSString *content = VCamWhitelistContents();
+    if (!content) {
+        NSLog(@"[VCamTestTweak] no whitelist file, all apps allowed");
+        return YES;
+    }
+    NSMutableArray<NSString *> *ids = [NSMutableArray array];
+    NSArray<NSString *> *lines =
+        [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    for (NSString *rawLine in lines) {
+        NSString *line = [rawLine stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (line.length == 0 || [line hasPrefix:@"#"]) {
+            continue;
+        }
+        [ids addObject:[line lowercaseString]];
+    }
+    if (ids.count == 0) {
+        NSLog(@"[VCamTestTweak] whitelist empty, all apps allowed");
+        return YES;
+    }
+    NSLog(@"[VCamTestTweak] whitelist active (%lu apps)", (unsigned long)ids.count);
+    return [ids containsObject:[bundleID lowercaseString]];
+}
+
 static BOOL VCamShouldAttach(void) {
     NSString *bundleID = NSBundle.mainBundle.bundleIdentifier;
     if (!bundleID) {
@@ -156,6 +198,10 @@ static BOOL VCamShouldAttach(void) {
         return NO;
     }
     if ([bundleID isEqualToString:@"com.apple.springboard"]) {
+        return NO;
+    }
+    if (!VCamIsWhitelisted(bundleID)) {
+        NSLog(@"[VCamTestTweak] %@ skipped (not in whitelist)", bundleID);
         return NO;
     }
     return YES;
