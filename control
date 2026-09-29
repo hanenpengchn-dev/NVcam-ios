@@ -1,7 +1,7 @@
 Package: com.tom.vcamtesttweak
 Name: VCam Test Tweak
-Version: 2.1.0
+Version: 2.2.0
 Architecture: iphoneos-arm64
-Description: VCam v2.1: album-video virtual camera source (+probe logs)
+Description: VCam v2.2: album-video virtual camera (robust video save)
 Maintainer: Local Test
 Depends: firmware (>= 15.0)

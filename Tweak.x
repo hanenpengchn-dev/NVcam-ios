@@ -452,6 +452,70 @@ static void VCamTrackPreviewLayer(CALayer *layer) {
 
 #pragma mark - Video picker
 
+static NSString *VCamSavePickedVideo(NSURL *srcURL) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *srcPath = srcURL.path;
+    NSDictionary *attrs = [fm attributesOfItemAtPath:srcPath error:NULL];
+    NSNumber *sizeNum = attrs[NSFileSize];
+    VCamLog(@"所选视频: %@ (%@ bytes)", srcPath.lastPathComponent, sizeNum ?: @"?");
+
+    NSMutableArray<NSString *> *dirs = [NSMutableArray array];
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *caches = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *tmp = NSTemporaryDirectory();
+    if (docs) [dirs addObject:docs];
+    if (caches) [dirs addObject:caches];
+    if (tmp) [dirs addObject:tmp];
+    [dirs addObject:@"/var/jb/var/mobile/Library/Preferences"];
+
+    for (NSString *dir in dirs) {
+        NSString *dst = [dir stringByAppendingPathComponent:@"vcam_picked.mov"];
+        @try {
+            NSError *err = nil;
+            [fm removeItemAtPath:dst error:NULL];
+            if ([fm copyItemAtPath:srcPath toPath:dst error:&err] && [fm fileExistsAtPath:dst]) {
+                VCamLog(@"视频已保存(拷贝): %@", dir);
+                return dst;
+            }
+            VCamLog(@"拷贝失败 [%@]: %@ (%@ %ld)", dir, err.localizedDescription ?: @"?", err.domain, (long)err.code);
+
+            NSError *mvErr = nil;
+            [fm removeItemAtPath:dst error:NULL];
+            if ([fm moveItemAtPath:srcPath toPath:dst error:&mvErr] && [fm fileExistsAtPath:dst]) {
+                VCamLog(@"视频已保存(移动): %@", dir);
+                return dst;
+            }
+
+            NSFileHandle *inFH = [NSFileHandle fileHandleForReadingAtPath:srcPath];
+            if (inFH) {
+                [fm removeItemAtPath:dst error:NULL];
+                [fm createFileAtPath:dst contents:nil attributes:nil];
+                NSFileHandle *outFH = [NSFileHandle fileHandleForWritingAtPath:dst];
+                if (outFH) {
+                    while (YES) {
+                        @autoreleasepool {
+                            NSData *chunk = [inFH readDataOfLength:(1024 * 1024)];
+                            if (chunk.length == 0) {
+                                break;
+                            }
+                            [outFH writeData:chunk];
+                        }
+                    }
+                    [outFH closeFile];
+                    [inFH closeFile];
+                    if ([fm fileExistsAtPath:dst]) {
+                        VCamLog(@"视频已保存(数据流): %@", dir);
+                        return dst;
+                    }
+                }
+            }
+        } @catch (NSException *e) {
+            VCamLog(@"保存异常 [%@]: %@", dir, e.reason ?: @"?");
+        }
+    }
+    return nil;
+}
+
 @interface VCamPickerDelegate : NSObject <PHPickerViewControllerDelegate>
 @end
 
@@ -469,20 +533,23 @@ static void VCamTrackPreviewLayer(CALayer *layer) {
             VCamLog(@"选视频失败: %@", error.localizedDescription ?: @"?");
             return;
         }
-        NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-        NSString *dst = [docs stringByAppendingPathComponent:@"vcam_picked.mov"];
-        NSFileManager *fm = [NSFileManager defaultManager];
-        [fm removeItemAtPath:dst error:NULL];
-        NSError *cpErr = nil;
-        if ([fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:dst] error:&cpErr]) {
+        NSString *saved = VCamSavePickedVideo(url);
+        if (saved) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 VCamIsOn = YES;
                 VCamApplyState();
-                VCamSetVideoSource(dst);
+                VCamSetVideoSource(saved);
                 VCamLog(@"已选相册视频，虚拟相机自动开启");
             });
+        } else if ([[NSFileManager defaultManager] fileExistsAtPath:url.path]) {
+            VCamLog(@"拷贝失败，尝试直接使用临时文件");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                VCamIsOn = YES;
+                VCamApplyState();
+                VCamSetVideoSource(url.path);
+            });
         } else {
-            VCamLog(@"保存视频失败: %@", cpErr.localizedDescription ?: @"?");
+            VCamLog(@"保存视频失败（所有路径都不可用）");
         }
     }];
 }
@@ -700,7 +767,7 @@ static void VCamInstallUI(UIWindow *window) {
         }
     }
 
-    VCamLog(@"attached (virtual-camera v2.1) in %@",
+    VCamLog(@"attached (virtual-camera v2.2) in %@",
             NSBundle.mainBundle.bundleIdentifier ?: @"<unknown>");
 }
 
