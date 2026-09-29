@@ -125,7 +125,7 @@ static void VCamInstallUI(UIWindow *window) {
 
     VCamApplyState();
 
-    NSLog(@"[VCamTestTweak] attached in %@",
+    NSLog(@"[VCamTestTweak] attached (all-apps build) in %@",
           NSBundle.mainBundle.bundleIdentifier ?: @"<unknown>");
 }
 
@@ -147,9 +147,22 @@ static void VCamTryAttach(int attemptsLeft) {
     });
 }
 
+static BOOL VCamShouldAttach(void) {
+    NSString *bundleID = NSBundle.mainBundle.bundleIdentifier;
+    if (!bundleID) {
+        return NO;
+    }
+    if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) {
+        return NO;
+    }
+    if ([bundleID isEqualToString:@"com.apple.springboard"]) {
+        return NO;
+    }
+    return YES;
+}
+
 %ctor {
-    if ([NSBundle.mainBundle.bundleIdentifier
-         isEqualToString:@"com.tom.VCamTestHost"]) {
+    if (VCamShouldAttach()) {
         VCamTryAttach(20);
     }
 }
