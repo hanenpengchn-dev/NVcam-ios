@@ -31,12 +31,23 @@ static int VCamVideoGen = 0;
 static int VCamVideoOrientation = 1;
 static CIContext *VCamCIContext = nil;
 static id VCamPicker = nil;
+static UIView *VCamBar = nil;
+static UIView *VCamLightView = nil;
+static UIView *VCamLightPanel = nil;
+static UIButton *VCamLightButton = nil;
+static BOOL VCamLightOn = NO;
+static int VCamLightColorIndex = 1;
+static CGFloat VCamLightBrightness = 0.35;
+static NSTimer *VCamKeeperTimer = nil;
+static double VCamLastAttachTime = 0;
 
 static void VCamTryAttach(int attemptsLeft);
 static void VCamApplyState(void);
 static void VCamStartOverlayTimerIfNeeded(void);
 static void VCamRestartVideoPump(void);
 static UIWindow *VCamFindWindow(void);
+static void VCamApplyLight(void);
+static void VCamStartKeeperIfNeeded(void);
 
 #pragma mark - Logging
 
@@ -663,6 +674,36 @@ static void VCamPresentVideoPicker(void) {
     });
 }
 
+#pragma mark - Light source
+
+static UIColor *VCamLightColor(void) {
+    switch (VCamLightColorIndex) {
+        case 0: return [UIColor colorWithRed:1.00 green:0.72 blue:0.35 alpha:1.0];
+        case 2: return [UIColor colorWithRed:0.65 green:0.82 blue:1.00 alpha:1.0];
+        default: return [UIColor colorWithWhite:1.0 alpha:1.0];
+    }
+}
+
+static void VCamApplyLight(void) {
+    if (!VCamLightView) {
+        return;
+    }
+    VCamLightView.hidden = !VCamLightOn;
+    VCamLightView.backgroundColor = [VCamLightColor() colorWithAlphaComponent:VCamLightBrightness];
+}
+
+static void VCamRefreshLightPanel(void) {
+    if (!VCamLightPanel) {
+        return;
+    }
+    for (UIView *v in VCamLightPanel.subviews) {
+        if ([v isKindOfClass:[UIButton class]] && v.tag >= 100 && v.tag <= 102) {
+            NSInteger idx = v.tag - 100;
+            v.layer.borderWidth = (idx == VCamLightColorIndex) ? 3.0 : 1.0;
+        }
+    }
+}
+
 #pragma mark - UI
 
 @interface VCamDragTarget : NSObject
@@ -747,6 +788,15 @@ static void VCamInstallUI(UIWindow *window) {
     [VCAMLogButton removeFromSuperview];
     [VCamLogPanel removeFromSuperview];
     [VCamVidButton removeFromSuperview];
+    [VCamLightView removeFromSuperview];
+    [VCamLightPanel removeFromSuperview];
+    [VCamLightButton removeFromSuperview];
+    [VCamBar removeFromSuperview];
+
+    VCamLightView = [[UIView alloc] initWithFrame:window.bounds];
+    VCamLightView.userInteractionEnabled = NO;
+    VCamLightView.hidden = YES;
+    [window addSubview:VCamLightView];
 
     VCAMLabel = [[UILabel alloc]
         initWithFrame:CGRectMake(16, 48, 230, 34)];
@@ -765,7 +815,10 @@ static void VCamInstallUI(UIWindow *window) {
     if (startX < 14.0) {
         startX = 14.0;
     }
-    VCAMToggleButton.frame = CGRectMake(startX, 120.0, side, side);
+    VCamBar = [[UIView alloc] initWithFrame:CGRectMake(startX, 120.0, side, 168.0)];
+    VCamBar.backgroundColor = [UIColor clearColor];
+
+    VCAMToggleButton.frame = CGRectMake(0, 0, side, side);
     VCAMToggleButton.layer.cornerRadius = side / 2.0;
     VCAMToggleButton.clipsToBounds = YES;
     VCAMToggleButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
@@ -782,11 +835,12 @@ static void VCamInstallUI(UIWindow *window) {
     UIPanGestureRecognizer *pan =
         [[UIPanGestureRecognizer alloc] initWithTarget:VCamDrag
                                                 action:@selector(handlePan:)];
-    [VCAMToggleButton addGestureRecognizer:pan];
-    [window addSubview:VCAMToggleButton];
+    [VCamBar addGestureRecognizer:pan];
+    [VCamBar addSubview:VCAMToggleButton];
+    [window addSubview:VCamBar];
 
     VCAMLogButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    VCAMLogButton.frame = CGRectMake(startX, 120.0 + side + 10.0, side, 30.0);
+    VCAMLogButton.frame = CGRectMake(0, 66.0, side, 30.0);
     VCAMLogButton.layer.cornerRadius = 15.0;
     VCAMLogButton.clipsToBounds = YES;
     VCAMLogButton.backgroundColor = [[UIColor colorWithRed:0.10 green:0.45 blue:0.90 alpha:0.85] colorWithAlphaComponent:0.9];
@@ -802,10 +856,10 @@ static void VCamInstallUI(UIWindow *window) {
             VCamRefreshLogUI();
         }
     }] forControlEvents:UIControlEventTouchUpInside];
-    [window addSubview:VCAMLogButton];
+    [VCamBar addSubview:VCAMLogButton];
 
     VCamVidButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    VCamVidButton.frame = CGRectMake(startX, 120.0 + side + 46.0, side, 30.0);
+    VCamVidButton.frame = CGRectMake(0, 102.0, side, 30.0);
     VCamVidButton.layer.cornerRadius = 15.0;
     VCamVidButton.clipsToBounds = YES;
     VCamVidButton.backgroundColor = [[UIColor colorWithRed:0.85 green:0.30 blue:0.55 alpha:0.9] colorWithAlphaComponent:0.9];
@@ -815,7 +869,98 @@ static void VCamInstallUI(UIWindow *window) {
     [VCamVidButton addAction:[UIAction actionWithHandler:^(UIAction *action) {
         VCamPresentVideoPicker();
     }] forControlEvents:UIControlEventTouchUpInside];
-    [window addSubview:VCamVidButton];
+    [VCamBar addSubview:VCamVidButton];
+
+    VCamLightButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    VCamLightButton.frame = CGRectMake(0, 138.0, side, 30.0);
+    VCamLightButton.layer.cornerRadius = 15.0;
+    VCamLightButton.clipsToBounds = YES;
+    VCamLightButton.backgroundColor = [[UIColor colorWithRed:0.95 green:0.75 blue:0.15 alpha:0.9] colorWithAlphaComponent:0.9];
+    VCamLightButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
+    [VCamLightButton setTitle:@"灯" forState:UIControlStateNormal];
+    [VCamLightButton setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
+    [VCamLightButton addAction:[UIAction actionWithHandler:^(UIAction *action) {
+        if (!VCamLightPanel) {
+            return;
+        }
+        VCamLightPanel.hidden = !VCamLightPanel.hidden;
+        if (!VCamLightPanel.hidden) {
+            VCamRefreshLightPanel();
+        }
+    }] forControlEvents:UIControlEventTouchUpInside];
+    [VCamBar addSubview:VCamLightButton];
+
+    VCamLightPanel = [[UIView alloc] initWithFrame:CGRectMake(16, 320, 300, 100)];
+    VCamLightPanel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.80];
+    VCamLightPanel.layer.cornerRadius = 10.0;
+    VCamLightPanel.hidden = YES;
+
+    UILabel *lightTitle = [[UILabel alloc] initWithFrame:CGRectMake(10, 6, 120, 18)];
+    lightTitle.text = @"三色光源";
+    lightTitle.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+    lightTitle.textColor = [UIColor whiteColor];
+    [VCamLightPanel addSubview:lightTitle];
+
+    NSArray<UIColor *> *swatches = @[
+        [UIColor colorWithRed:1.00 green:0.72 blue:0.35 alpha:1.0],
+        [UIColor colorWithWhite:1.0 alpha:1.0],
+        [UIColor colorWithRed:0.65 green:0.82 blue:1.00 alpha:1.0]
+    ];
+    for (int i = 0; i < 3; i++) {
+        int idx = i;
+        UIButton *sw = [UIButton buttonWithType:UIButtonTypeCustom];
+        sw.frame = CGRectMake(10.0 + i * 40.0, 30.0, 32.0, 32.0);
+        sw.tag = 100 + i;
+        sw.backgroundColor = swatches[(NSUInteger)i];
+        sw.layer.cornerRadius = 16.0;
+        sw.layer.borderWidth = 1.0;
+        sw.layer.borderColor = [[UIColor whiteColor] colorWithAlphaComponent:0.6].CGColor;
+        [sw addAction:[UIAction actionWithHandler:^(UIAction *action) {
+            VCamLightColorIndex = idx;
+            VCamLightOn = YES;
+            VCamApplyLight();
+            VCamRefreshLightPanel();
+            VCamLog(@"光源: 颜色%d 开", idx);
+        }] forControlEvents:UIControlEventTouchUpInside];
+        [VCamLightPanel addSubview:sw];
+    }
+
+    UIButton *lightPower = [UIButton buttonWithType:UIButtonTypeCustom];
+    lightPower.frame = CGRectMake(136.0, 30.0, 60.0, 32.0);
+    lightPower.layer.cornerRadius = 8.0;
+    lightPower.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.22];
+    lightPower.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+    [lightPower setTitle:@"开/关" forState:UIControlStateNormal];
+    [lightPower setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [lightPower addAction:[UIAction actionWithHandler:^(UIAction *action) {
+        VCamLightOn = !VCamLightOn;
+        VCamApplyLight();
+        VCamLog(@"光源: %@", VCamLightOn ? @"ON" : @"OFF");
+    }] forControlEvents:UIControlEventTouchUpInside];
+    [VCamLightPanel addSubview:lightPower];
+
+    UILabel *brightLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 68, 34, 20)];
+    brightLabel.text = @"亮度";
+    brightLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    brightLabel.textColor = [UIColor whiteColor];
+    [VCamLightPanel addSubview:brightLabel];
+
+    UISlider *brightSlider = [[UISlider alloc] initWithFrame:CGRectMake(44, 64, 246, 28)];
+    brightSlider.minimumValue = 0.05;
+    brightSlider.maximumValue = 0.90;
+    brightSlider.value = (float)VCamLightBrightness;
+    __weak UISlider *weakSlider = brightSlider;
+    [brightSlider addAction:[UIAction actionWithHandler:^(UIAction *action) {
+        UISlider *s = weakSlider;
+        if (!s) {
+            return;
+        }
+        VCamLightBrightness = (CGFloat)s.value;
+        VCamApplyLight();
+    }] forControlEvents:UIControlEventValueChanged];
+    [VCamLightPanel addSubview:brightSlider];
+
+    [window addSubview:VCamLightPanel];
 
     VCamLogPanel = [[UIView alloc] initWithFrame:CGRectMake(16, 92, 320, 210)];
     VCamLogPanel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.80];
@@ -861,7 +1006,11 @@ static void VCamInstallUI(UIWindow *window) {
         VCamLog(@"已有视频素材，自动开启虚拟相机");
     }
 
-    VCamLog(@"attached (virtual-camera v2.4) in %@",
+    VCamApplyLight();
+    VCamStartKeeperIfNeeded();
+    VCamLastAttachTime = [NSDate timeIntervalSinceReferenceDate];
+
+    VCamLog(@"attached (virtual-camera v2.5) in %@",
             NSBundle.mainBundle.bundleIdentifier ?: @"<unknown>");
 }
 
@@ -881,6 +1030,39 @@ static void VCamTryAttach(int attemptsLeft) {
         }
         VCamInstallUI(window);
     });
+}
+
+static void VCamStartKeeperIfNeeded(void) {
+    if (VCamKeeperTimer) {
+        return;
+    }
+    VCamKeeperTimer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
+        BOOL attached = (VCAMLabel && VCAMLabel.window && !VCAMLabel.window.hidden &&
+                         VCamLightView && VCamLightView.window);
+        if (!attached) {
+            double now = [NSDate timeIntervalSinceReferenceDate];
+            if (now - VCamLastAttachTime < 5.0) {
+                return;
+            }
+            UIWindow *w = VCamFindWindow();
+            if (!w) {
+                return;
+            }
+            VCamLog(@"UI 保活: 重新挂载到新窗口");
+            VCamInstallUI(w);
+            return;
+        }
+        UIWindow *w = VCAMLabel.window;
+        NSMutableArray<UIView *> *own = [NSMutableArray array];
+        if (VCamLightView) [own addObject:VCamLightView];
+        if (VCAMLabel) [own addObject:VCAMLabel];
+        if (VCamBar) [own addObject:VCamBar];
+        if (VCamLightPanel) [own addObject:VCamLightPanel];
+        if (VCamLogPanel) [own addObject:VCamLogPanel];
+        for (UIView *v in own) {
+            [w bringSubviewToFront:v];
+        }
+    }];
 }
 
 #pragma mark - Whitelist
